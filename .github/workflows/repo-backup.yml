@@ -142,7 +142,7 @@ jobs:
           echo "- ${line}"
         done)
 
-        DESCRIPTION="**${{ steps.archive.outputs.repo-count }} repos** archived (${{ steps.archive.outputs.total-size }}MB) to R2\nDuration: ${DURATION_STR}\n\n${REPO_LIST}\n\n[View Run](${RUN_URL})"
+        DESCRIPTION=$(printf "**${{ steps.archive.outputs.repo-count }} repos** archived (${{ steps.archive.outputs.total-size }}MB) to R2\nDuration: %s\n\n%s\n\n[View Run](%s)" "$DURATION_STR" "$REPO_LIST" "$RUN_URL")
 
         jq -n --arg desc "$DESCRIPTION" '{
           "embeds": [{
@@ -162,11 +162,13 @@ jobs:
         DURATION_STR="$((DURATION / 60))m $((DURATION % 60))s"
         RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-        jq -n --arg url "$RUN_URL" --arg dur "$DURATION_STR" '{
+        DESCRIPTION=$(printf "Backup failed after %s\n\n[View Run](%s)" "$DURATION_STR" "$RUN_URL")
+
+        jq -n --arg desc "$DESCRIPTION" '{
           "content": "@everyone",
           "embeds": [{
             "title": "❌ Repo Backup Failed — ${{ github.repository }}",
-            "description": ("Backup failed after " + $dur + "\n\n[View Run](" + $url + ")"),
+            "description": $desc,
             "color": 15548997,
             "timestamp": (now | todate)
           }]
