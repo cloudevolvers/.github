@@ -10,7 +10,7 @@ env:
   R2_ENDPOINT: https://3357d9740fb8e64bc1a8cb07a4e96da6.r2.cloudflarestorage.com
   RETENTION_DAYS: 10
   GITHUB_ORG: cloudevolvers
-  DISCORD_WEBHOOK: https://discord-notifier.reactor-servers.workers.dev/notify
+  DISCORD_WEBHOOK: ${{ secrets.DISCORD_SPOTCLOUD_PIPELINE_WEBHOOK_SECRET }}
 
 jobs:
   backup:
@@ -129,6 +129,7 @@ jobs:
 
     - name: Notify success
       if: success()
+      continue-on-error: true
       run: |
         DURATION=$(( $(date +%s) - START_TIME ))
         DURATION_STR="$((DURATION / 60))m $((DURATION % 60))s"
@@ -177,6 +178,7 @@ jobs:
 
     - name: Notify failure
       if: failure()
+      continue-on-error: true
       run: |
         DURATION=$(( $(date +%s) - ${START_TIME:-$(date +%s)} ))
         DURATION_STR="$((DURATION / 60))m $((DURATION % 60))s"
