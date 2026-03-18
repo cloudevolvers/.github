@@ -1,0 +1,219 @@
+name: Organization Repository Backup
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+env:
+  R2_BUCKET: github-backups
+  R2_ENDPOINT: https://3357d9740fb8e64bc1a8cb07a4e96da6.r2.cloudflarestorage.com
+  RETENTION_DAYS: 10
+  GITHUB_ORG: cloudevolvers
+  DISCORD_WEBHOOK: https://discord-notifier.reactor-servers.workers.dev/notify
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Start timer
+      run: echo "START_TIME=$(date +%s)" >> "$GITHUB_ENV"
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure Credentials
+      run: |
+        echo "GITHUB_TOKEN=${{ secrets.ORG_BACKUP_TOKEN }}" >> $GITHUB_ENV
+        echo "AWS_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+        echo "AWS_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+
+    - name: Setup Date
+      id: date
+      run: |
+        BACKUP_DATE=$(date +%Y-%m-%d_%H-%M-%S)
+        echo "backup-date=$BACKUP_DATE" >> $GITHUB_OUTPUT
+        echo "BACKUP_DATE=$BACKUP_DATE" >> $GITHUB_ENV
+
+    - name: Discover Repositories
+      id: repos
+      run: |
+        CUTOFF=$(date -u -d '6 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+        REPO_DATA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          "https://api.github.com/orgs/$GITHUB_ORG/repos?per_page=100&type=all")
+
+        REPOS=$(echo "$REPO_DATA" | jq -r '.[].name' | sort | tr '\n' ' ')
+        echo "repos=$REPOS" >> $GITHUB_OUTPUT
+        REPO_COUNT=$(echo $REPOS | wc -w)
+        echo "repo-count=$REPO_COUNT" >> $GITHUB_OUTPUT
+
+        CHANGED=$(echo "$REPO_DATA" | jq -r --arg cutoff "$CUTOFF" \
+          '[.[] | select(.pushed_at > $cutoff) | .name] | sort | join(", ")')
+        CHANGED_COUNT=$(echo "$REPO_DATA" | jq -r --arg cutoff "$CUTOFF" \
+          '[.[] | select(.pushed_at > $cutoff)] | length')
+
+        echo "changed=$CHANGED" >> $GITHUB_OUTPUT
+        echo "changed-count=$CHANGED_COUNT" >> $GITHUB_OUTPUT
+        echo "Found $REPO_COUNT repositories ($CHANGED_COUNT changed since last backup)"
+
+    - name: Clone and Archive
+      id: archive
+      run: |
+        mkdir -p backups && cd backups
+        TOTAL_SIZE=0
+        REPO_COUNT=0
+        REPO_DETAILS=""
+
+        for repo in ${{ steps.repos.outputs.repos }}; do
+          echo "Backing up: $repo"
+          git clone --mirror "https://$GITHUB_TOKEN@github.com/$GITHUB_ORG/$repo.git" "$repo.git" 2>/dev/null
+
+          BRANCHES=$(git -C "$repo.git" branch | wc -l)
+          DEFAULT=$(git -C "$repo.git" symbolic-ref HEAD 2>/dev/null | sed 's|refs/heads/||')
+
+          tar -czf "${repo}_${BACKUP_DATE}.tar.gz" "$repo.git"
+          SIZE_BYTES=$(stat -c%s "${repo}_${BACKUP_DATE}.tar.gz")
+          SIZE_MB=$(awk "BEGIN {printf \"%.1f\", ${SIZE_BYTES}/1048576}")
+          TOTAL_SIZE=$((TOTAL_SIZE + SIZE_BYTES))
+          REPO_COUNT=$((REPO_COUNT + 1))
+          rm -rf "$repo.git"
+
+          LINE="${repo} (${SIZE_MB}MB, ${BRANCHES} branches, default: ${DEFAULT})"
+          if [ -z "$REPO_DETAILS" ]; then
+            REPO_DETAILS="$LINE"
+          else
+            REPO_DETAILS="${REPO_DETAILS}|${LINE}"
+          fi
+          echo "  ${LINE}"
+        done
+
+        TOTAL_MB=$(awk "BEGIN {printf \"%.1f\", ${TOTAL_SIZE}/1048576}")
+        echo "total-size=$TOTAL_MB" >> $GITHUB_OUTPUT
+        echo "repo-count=$REPO_COUNT" >> $GITHUB_OUTPUT
+        echo "repo-details=$REPO_DETAILS" >> $GITHUB_OUTPUT
+        echo "Archived $REPO_COUNT repos, total: ${TOTAL_MB}MB"
+
+    - name: Upload to Cloudflare R2
+      run: |
+        pip install awscli --quiet
+        cd backups
+        for f in *.tar.gz; do
+          aws s3 cp "$f" "s3://$R2_BUCKET/cloudevolvers/$BACKUP_DATE/$f" \
+            --endpoint-url "$R2_ENDPOINT" --no-progress
+          echo "Uploaded: $f"
+        done
+
+    - name: Cleanup Old Backups
+      id: cleanup
+      continue-on-error: true
+      run: |
+        CUTOFF=$(date -d "$RETENTION_DAYS days ago" +%Y-%m-%d)
+        echo "Removing backups older than $CUTOFF"
+        PREFIXES=$(aws s3 ls "s3://$R2_BUCKET/cloudevolvers/" --endpoint-url "$R2_ENDPOINT" | \
+          awk '{print $2}' | sed 's|/||')
+        TOTAL_SETS=$(echo "$PREFIXES" | wc -w)
+        DELETED=0
+        for prefix in $PREFIXES; do
+          DATE_PART=$(echo "$prefix" | cut -d_ -f1-3 | tr '_' '-' | cut -d- -f1-3)
+          if [[ "$DATE_PART" < "$CUTOFF" ]]; then
+            aws s3 rm "s3://$R2_BUCKET/cloudevolvers/$prefix/" --recursive \
+              --endpoint-url "$R2_ENDPOINT" --quiet 2>/dev/null || true
+            DELETED=$((DELETED + 1))
+            echo "Deleted: $prefix"
+          fi
+        done
+        REMAINING=$((TOTAL_SETS - DELETED + 1))
+        echo "backup-sets=$REMAINING" >> $GITHUB_OUTPUT
+        echo "deleted=$DELETED" >> $GITHUB_OUTPUT
+        echo "Cleaned up $DELETED old backup sets, $REMAINING sets stored"
+
+    - name: Notify success
+      if: success()
+      run: |
+        DURATION=$(( $(date +%s) - START_TIME ))
+        DURATION_STR="$((DURATION / 60))m $((DURATION % 60))s"
+        CHANGED="${{ steps.repos.outputs.changed }}"
+        CHANGED_COUNT="${{ steps.repos.outputs.changed-count }}"
+        BACKUP_SETS="${{ steps.cleanup.outputs.backup-sets }}"
+        DELETED="${{ steps.cleanup.outputs.deleted }}"
+
+        REPO_LIST=$(echo "${{ steps.archive.outputs.repo-details }}" | tr '|' '\n' | while read -r line; do
+          echo "- ${line}"
+        done)
+        REPO_LIST_ESCAPED=$(echo "$REPO_LIST" | sed ':a;N;$!ba;s/\n/\\n/g')
+
+        HEADER="**${{ steps.archive.outputs.repo-count }} repos** archived (${{ steps.archive.outputs.total-size }}MB) to R2"
+
+        if [ "$CHANGED_COUNT" -gt 0 ] 2>/dev/null && [ -n "$CHANGED" ]; then
+          HEADER="${HEADER}\\n**${CHANGED_COUNT} changed**: ${CHANGED}"
+        else
+          HEADER="${HEADER}\\nNo repos changed since last backup"
+        fi
+
+        STORAGE="**${BACKUP_SETS:-?} backup sets** stored (${RETENTION_DAYS}-day retention)"
+        if [ "${DELETED:-0}" -gt 0 ]; then
+          STORAGE="${STORAGE}, ${DELETED} old sets cleaned up"
+        fi
+
+        DETAILS="${HEADER}\\n${STORAGE}\\n\\n${REPO_LIST_ESCAPED}"
+
+        curl -s -X POST "$DISCORD_WEBHOOK" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"status\": \"success\",
+            \"workflow\": \"GitHub Repository Backup\",
+            \"repo\": \"${{ github.repository }}\",
+            \"runId\": \"${{ github.run_id }}\",
+            \"actor\": \"scheduled\",
+            \"duration\": \"${DURATION_STR}\",
+            \"details\": \"${DETAILS}\",
+            \"stages\": [
+              {\"name\": \"Discover Repos\", \"status\": \"success\"},
+              {\"name\": \"Clone & Archive\", \"status\": \"success\"},
+              {\"name\": \"Upload to R2\", \"status\": \"success\"},
+              {\"name\": \"Cleanup Old Backups\", \"status\": \"success\"}
+            ]
+          }" || true
+
+    - name: Notify failure
+      if: failure()
+      run: |
+        DURATION=$(( $(date +%s) - ${START_TIME:-$(date +%s)} ))
+        DURATION_STR="$((DURATION / 60))m $((DURATION % 60))s"
+        RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+        curl -s -X POST "$DISCORD_WEBHOOK" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"status\": \"failure\",
+            \"workflow\": \"GitHub Repository Backup\",
+            \"repo\": \"${{ github.repository }}\",
+            \"runId\": \"${{ github.run_id }}\",
+            \"actor\": \"scheduled\",
+            \"duration\": \"${DURATION_STR}\",
+            \"mentionContent\": \"@everyone GitHub repository backup failed! [View Run](${RUN_URL})\",
+            \"stages\": [
+              {\"name\": \"Discover Repos\", \"status\": \"failure\"},
+              {\"name\": \"Clone & Archive\", \"status\": \"pending\"},
+              {\"name\": \"Upload to R2\", \"status\": \"pending\"},
+              {\"name\": \"Cleanup Old Backups\", \"status\": \"pending\"}
+            ]
+          }" || true
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "## Backup Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Date**: ${{ steps.date.outputs.backup-date }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Repos**: ${{ steps.repos.outputs.repo-count }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Size**: ${{ steps.archive.outputs.total-size }}MB" >> $GITHUB_STEP_SUMMARY
+        echo "- **Storage**: Cloudflare R2 (\`$R2_BUCKET/cloudevolvers\`)" >> $GITHUB_STEP_SUMMARY
+        echo "- **Backup sets stored**: ${{ steps.cleanup.outputs.backup-sets }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Retention**: $RETENTION_DAYS days" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Repositories" >> $GITHUB_STEP_SUMMARY
+        echo "${{ steps.archive.outputs.repo-details }}" | tr '|' '\n' | while read -r line; do
+          echo "- ${line}" >> $GITHUB_STEP_SUMMARY
+        done
